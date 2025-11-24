@@ -1,129 +1,232 @@
-import json
+#comparison.py (연주 비교 및 피드백)
 import pickle
 import numpy as np
 import librosa
+import pretty_midi
 
-# --- 설정 ---
-JSON_ANSWER_KEY_FILE = "answer_key.json" # 1. 원곡 정답지 (1단계 산출물)
-ANALYSIS_DATA_FILE = "user_analysis.pkl" # 2. 사용자 CQT 데이터 (2단계 산출물)
-FEEDBACK_FILE = "feedback_report.txt"    # 3. 최종 피드백 결과물
-# --------------
+# --- [설정] ---
+ANSWER_KEY_FILE = "summer.mid"
+ANALYSIS_DATA_FILE = "user_analysis.pkl"
+FEEDBACK_FILE = "feedback_report.txt"
+
+# --- [판정 파라미터] ---
+TIMING_WINDOW = 1.5
+TOLERANCE_PERFECT = 0.25
+TOLERANCE_GOOD = 0.8
+
+NOTE_THRESHOLD = -40.0
+SILENCE_THRESHOLD = -55.0
+PITCH_TOLERANCE = 1
+
+# --- [점수 배점] ---
+SCORE_PERFECT = 100
+SCORE_GOOD = 95
+SCORE_BAD = 60
+SCORE_MISS = 0
 
 def time_to_cqt_frame(time_sec, sr, hop_length):
-    """
-    시간(초)을 CQT 프레임 인덱스로 변환합니다.
-    (analyze_user.py와 동일한 로직)
-    """
-    return librosa.time_to_frames([time_sec], sr=sr, hop_length=hop_length)[0]
+    return librosa.time_to_frames([max(0, time_sec)], sr=sr, hop_length=hop_length)[0]
 
 def midi_to_cqt_bin(pitch_midi, fmin_midi=36):
-    """
-    MIDI 피치 번호를 CQT의 '행(bin)' 인덱스로 변환합니다.
-    (C2 = 36, CQT를 fmin=C2로 생성했다고 가정)
-    """
-    # C2(36)가 0번 행, C#2(37)가 1번 행...
     return pitch_midi - fmin_midi
 
-# -----------------------------------------------------------------
-# 메인 비교/채점 로직
-# -----------------------------------------------------------------
-def generate_feedback_report(answer_key_path, user_data_path):
-    """
-    "정답지(JSON)"와 "사용자 CQT 데이터"를 비교하여
-    시간대별 피드백 리포트를 생성합니다.
-    """
-    
-    print("--- STAGE 3: Comparing Answer Key vs User Data ---")
-    
-    # 1. "정답지" (JSON) 로드
+def load_notes_from_midi(midi_path):
     try:
-        with open(answer_key_path, 'r', encoding='utf-8') as f:
-            answer_notes = json.load(f)
-        print(f"Loaded Answer Key: '{answer_key_path}' ({len(answer_notes)} notes)")
-    except FileNotFoundError:
-        print(f"ERROR: Answer Key file '{answer_key_path}' not found.")
+        midi_data = pretty_midi.PrettyMIDI(midi_path)
+        notes_list = []
+        for instrument in midi_data.instruments:
+            if not instrument.is_drum:
+                for note in instrument.notes:
+                    notes_list.append({
+                        "start": note.start,
+                        "end": note.end,
+                        "pitch": note.pitch
+                    })
+        notes_list.sort(key=lambda x: x["start"])
+        return notes_list
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return []
+
+def find_audio_start_frame(cqt_db, threshold=-50.0):
+    n_bins, n_frames = cqt_db.shape
+    for t in range(n_frames):
+        if np.max(cqt_db[:, t]) > threshold:
+            return t
+    return 0
+
+def generate_feedback_report(answer_key_path, user_data_path):
+    print(f"--- STAGE 3: Final Feedback Generation ---")
+    
+    if answer_key_path.endswith(('.mid', '.midi')):
+        answer_notes = load_notes_from_midi(answer_key_path)
+    else:
+        print("Error: Please use a MIDI file.")
         return
 
-    # 2. "사용자 CQT 데이터" (Pickle) 로드
     try:
         with open(user_data_path, 'rb') as f:
             user_data = pickle.load(f)
-        user_cqt_db = user_data["cqt_db"] # "열화상 사진"
-        user_sr = user_data["sr"]
-        user_hop_length = user_data["hop_length"] # hop_length (512)
-        print(f"Loaded User Data: '{user_data_path}' (CQT Shape: {user_cqt_db.shape})")
     except FileNotFoundError:
-        print(f"ERROR: User Data file '{user_data_path}' not found.")
+        print("Error: User analysis file not found.")
         return
-        
-    feedback_report = [] # 최종 피드백을 저장할 리스트
-    fmin_midi = 36 # C2 (CQT 분석 시작점)
     
-    # 3. "정답지" 노트를 하나씩 순회하며 "열화상 사진"과 비교
+    user_cqt_db = user_data["cqt_db"]
+    user_sr = user_data["sr"]
+    user_hop_length = user_data["hop_length"]
+    
+    if not answer_notes: return
+    midi_start_time = answer_notes[0]["start"]
+    audio_start_frame = find_audio_start_frame(user_cqt_db, threshold=SILENCE_THRESHOLD)
+    audio_start_time = librosa.frames_to_time(audio_start_frame, sr=user_sr, hop_length=user_hop_length)
+    sync_offset = audio_start_time - midi_start_time
+    
+    print(f"🔍 Sync Offset Applied: {sync_offset:+.2f} sec")
+
+    feedback_report = []
+    fmin_midi = 36
+    
+    count_perfect = 0
+    count_good = 0
+    count_bad = 0
+    count_miss = 0
+    total_notes = 0
+    
+    # --- 상세 분석 루프 ---
     for i, note in enumerate(answer_notes):
+        total_notes += 1
         
-        # (테스트용) 너무 많으니 일단 45개 노트만 피드백
-        if i >= 45:
-            feedback_report.append("\n... (Feedback limited to 45 notes for testing) ...")
-            break
+        target_time = note["start"] + sync_offset
+        target_pitch = note["pitch"]
+        target_note_name = librosa.midi_to_note(target_pitch)
+        target_bin = midi_to_cqt_bin(target_pitch, fmin_midi)
+
+        # 1. Good 범위 탐색
+        good_start_time = max(0, target_time - TOLERANCE_GOOD)
+        good_end_time = target_time + TOLERANCE_GOOD
+        
+        s_frame = time_to_cqt_frame(good_start_time, user_sr, user_hop_length)
+        e_frame = time_to_cqt_frame(good_end_time, user_sr, user_hop_length)
+        
+        if e_frame <= s_frame: e_frame = s_frame + 1
+        if e_frame > user_cqt_db.shape[1]: e_frame = user_cqt_db.shape[1]
+
+        bin_start = max(0, target_bin - PITCH_TOLERANCE)
+        bin_end = min(user_cqt_db.shape[0], target_bin + PITCH_TOLERANCE + 1)
+        
+        good_zone_slice = user_cqt_db[bin_start:bin_end, s_frame:e_frame]
+        
+        feedback = f"[Time: {note['start']:.2f}s] {target_note_name}: "
+        
+        if good_zone_slice.size > 0 and np.max(good_zone_slice) > NOTE_THRESHOLD:
+            max_idx_flat = np.argmax(good_zone_slice)
+            max_idx_2d = np.unravel_index(max_idx_flat, good_zone_slice.shape)
+            played_frame = s_frame + max_idx_2d[1]
+            played_time = librosa.frames_to_time(played_frame, sr=user_sr, hop_length=user_hop_length)
             
-        t_start = note["start"]
-        t_end = note["end"]
-        pitch = note["pitch"]
-        note_name = librosa.midi_to_note(pitch)
-        
-        # 4. 시간/음정 -> CQT의 (행, 열) 인덱스로 변환
-        start_frame = time_to_cqt_frame(t_start, sr=user_sr, hop_length=user_hop_length)
-        end_frame = time_to_cqt_frame(t_end, sr=user_sr, hop_length=user_hop_length)
-        pitch_bin = midi_to_cqt_bin(pitch, fmin_midi=fmin_midi)
-
-        # (예외 처리)
-        if pitch_bin < 0 or pitch_bin >= user_cqt_db.shape[0]: continue
-        if end_frame >= user_cqt_db.shape[1]: break
-
-        # 5. "열화상 사진"에서 해당 (행, 열) 영역을 '조회'
-        # [행=음높이, 열=시간]
-        note_cqt_slice = user_cqt_db[pitch_bin, start_frame:end_frame]
-        
-        # 6. 피드백 생성 (단순 로직 예시)
-        # CQT 값은 dB 단위 (0에 가까울수록 에너지가 큼)
-        average_energy = np.mean(note_cqt_slice)
-        
-        feedback = f"[{t_start:.2f}s] Note '{note_name}': "
-        
-        # (임계값 예시) -25dB보다 크면 '성공' (소리가 났음)
-        if average_energy > -25.0:
-            feedback += f"✅ OK (Avg. Energy: {average_energy:.1f} dB)"
+            time_diff = played_time - target_time
+            abs_diff = abs(time_diff)
+            timing_msg = f"(Diff: {time_diff:+.2f}s)"
+            
+            if abs_diff <= TOLERANCE_PERFECT:
+                feedback += f"🏆 PERFECT {timing_msg}"
+                count_perfect += 1
+            else:
+                feedback += f"🟢 GOOD {timing_msg}"
+                count_good += 1
         else:
-            # (실패) 소리가 안 났거나, 다른 음을 쳤음
-            # -> 해당 시간대에 가장 크게 울린 음을 역추적
-            full_slice_at_start = user_cqt_db[:, start_frame] # 시작 시점의 세로줄
-            loudest_bin_index = np.argmax(full_slice_at_start)
-            loudest_pitch_midi = loudest_bin_index + fmin_midi
-            loudest_note_name = librosa.midi_to_note(loudest_pitch_midi)
+            # 2. Bad 범위 탐색
+            bad_start_time = max(0, target_time - TIMING_WINDOW)
+            bad_end_time = target_time + TIMING_WINDOW
+            bs_frame = time_to_cqt_frame(bad_start_time, user_sr, user_hop_length)
+            be_frame = time_to_cqt_frame(bad_end_time, user_sr, user_hop_length)
+            if be_frame > user_cqt_db.shape[1]: be_frame = user_cqt_db.shape[1]
             
-            feedback += f"❌ MISSED! (Avg. Energy: {average_energy:.1f} dB). "
-            feedback += f"Detected '{loudest_note_name}' instead."
+            bad_zone_slice = user_cqt_db[bin_start:bin_end, bs_frame:be_frame]
             
+            if bad_zone_slice.size > 0 and np.max(bad_zone_slice) > NOTE_THRESHOLD:
+                max_idx_flat = np.argmax(bad_zone_slice)
+                max_idx_2d = np.unravel_index(max_idx_flat, bad_zone_slice.shape)
+                played_frame = bs_frame + max_idx_2d[1]
+                played_time = librosa.frames_to_time(played_frame, sr=user_sr, hop_length=user_hop_length)
+                
+                time_diff = played_time - target_time
+                speed_msg = "Too FAST" if time_diff < 0 else "Too SLOW"
+                feedback += f⚠️ BAD - {speed_msg} {timing_msg}"
+                count_bad += 1
+            else:
+                count_miss += 1
+                center_frame = time_to_cqt_frame(target_time, user_sr, user_hop_length)
+                if center_frame < user_cqt_db.shape[1]:
+                    full_slice = user_cqt_db[:, center_frame]
+                    loudest_bin = np.argmax(full_slice)
+                    if full_slice[loudest_bin] > NOTE_THRESHOLD:
+                        wrong_note = librosa.midi_to_note(loudest_bin + fmin_midi)
+                        feedback += f"❌ MISS (Wrong Note: {wrong_note})"
+                    else:
+                        feedback += f"❌ MISS (Silence)"
+                else:
+                    feedback += "❌ MISS"
+
         feedback_report.append(feedback)
 
+    # --- 통계 계산 ---
+    if total_notes > 0:
+        hit_count = count_perfect + count_good + count_bad
+        pitch_accuracy = (hit_count / total_notes) * 100
+        
+        if hit_count > 0:
+            timing_accuracy = ((count_perfect + count_good) / hit_count) * 100
+        else:
+            timing_accuracy = 0.0
+            
+        weighted_score_sum = (count_perfect * SCORE_PERFECT) + \
+                             (count_good * SCORE_GOOD) + \
+                             (count_bad * SCORE_BAD) + \
+                             (count_miss * SCORE_MISS)
+        max_possible_score = total_notes * SCORE_PERFECT
+        total_accuracy = (weighted_score_sum / max_possible_score) * 100
+    else:
+        pitch_accuracy = 0.0
+        timing_accuracy = 0.0
+        total_accuracy = 0.0
+
+    # --- 결과 출력 및 저장 ---
+    summary = []
+    summary.append("=" * 40)
+    summary.append(f"🎹 FINAL ANALYSIS REPORT")
+    summary.append("=" * 40)
+    summary.append(f"• Total Notes: {total_notes}")
+    summary.append(f"• Perfect: {count_perfect} \t(Score: {SCORE_PERFECT})")
+    summary.append(f"• Good:    {count_good} \t(Score: {SCORE_GOOD})")
+    summary.append(f"• Bad:     {count_bad} \t(Score: {SCORE_BAD})")
+    summary.append(f"• Miss:    {count_miss} \t(Score: {SCORE_MISS})")
+    summary.append("-" * 40)
+    summary.append(f"🎵 음정 정확도 (Pitch Acc):  {pitch_accuracy:.1f}%")
+    summary.append(f"⏱️ 박자 정확도 (Timing Acc): {timing_accuracy:.1f}%")
+    summary.append(f"⭐ 전체 정확도 (Total Score): {total_accuracy:.1f}%")
+    summary.append("=" * 40)
+    
+    # 1. 요약 출력
+    print("\n".join(summary))
+    
+    # 2. 상세 내용 화면 출력 
+    print("\n--- Detail Feedback ---")
+    # 너무 길면 터미널이 꽉 차니까 원하면 아래 숫자(50)를 조절
+    # 전체를 다 보고 싶으면 [:50]을 지움
+    for line in feedback_report: 
+        print(line)
+
+    # 3. 파일 저장
+    with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
+        for line in summary:
+            f.write(line + "\n")
+        f.write("\n--- Detail Feedback ---\n")
+        for line in feedback_report:
+            f.write(line + "\n")
+            
+    print(f"\n✅ Feedback saved to '{FEEDBACK_FILE}'")
     return feedback_report
 
-# -----------------------------------------------------------------
-# 메인 코드 실행
-# -----------------------------------------------------------------
 if __name__ == "__main__":
-    report = generate_feedback_report(JSON_ANSWER_KEY_FILE, ANALYSIS_DATA_FILE)
-    
-    if report:
-        print(f"\n\n--- 🎹 FINAL FEEDBACK REPORT (Mode 3-1) ---")
-        # 1. 터미널에 출력
-        for line in report:
-            print(line)
-            
-        # 2. 파일(.txt)로 저장
-        with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
-            f.write("--- 🎹 FINAL FEEDBACK REPORT (Mode 3-1) ---\n")
-            for line in report:
-                f.write(line + "\n")
-        print(f"\n✅ Feedback report saved to '{FEEDBACK_FILE}'.")
+    generate_feedback_report(ANSWER_KEY_FILE, ANALYSIS_DATA_FILE)
